@@ -39,4 +39,7 @@ tone = blip(met, freq=pitch, dur=0.4, mul=0.3).out()
 #   tone.input = Metro(0.3).play()   # cross-fade to another trigger source
 # Open the control window with: tone.ctrl()
 
+# The generated object can be passed to other PyoObjects
+sc = Scope(tone)
+
 s.gui(locals())

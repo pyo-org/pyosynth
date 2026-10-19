@@ -14,3 +14,5 @@ Example usage:
     sin = sine.out()
     sin.set('amp', 0.5)
     sin.freq(660)
+
+This code is AI-generated
