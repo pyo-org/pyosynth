@@ -8,7 +8,7 @@ shapes a sine wave, and a TrigChoice picks a new pitch on every trigger.
 from pyo import *
 from pyosynth import pyosynth
 
-s = Server(audio="jack").boot()
+s = Server().boot()
 
 
 @pyosynth
