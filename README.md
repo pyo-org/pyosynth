@@ -15,4 +15,6 @@ Example usage:
     sin.set('amp', 0.5)
     sin.freq(660)
 
+Check `example.py` for more details.
+
 This code is AI-generated
