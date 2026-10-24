@@ -30,16 +30,38 @@ Parameter rules (the function's signature is the synth's interface):
   ``InputFader``, so ``set()`` cross-fades between old and new sources.
 * Return a PyoObject (or a list/tuple of PyoObjects) as the output.
 * ``mul`` and ``add`` are added to the signature automatically.
+* ``Adsr`` and ``Fader`` objects inside the graph are treated as envelopes:
+  ``play()``/``out()`` triggers them, and ``stop()`` releases them (the
+  release is heard) and stops everything afterwards. Re-trigger a stopped
+  synth with ``out()``, as with any Pyo object.
+* To add your own methods, decorate a class instead: the graph goes in
+  ``build(self, ...)`` (same parameter rules as above), and any other method
+  or attribute becomes part of the synth. Methods like ``play``/``stop`` can
+  be overridden and call ``super()``.
+
+      @pyosynth
+      class Pad:
+          def build(self, freq=220, amp=0.5):
+              self.adsr = Adsr(release=2, mul=amp)
+              return SuperSaw(freq, mul=self.adsr)
+
+          def note_off(self):
+              self.adsr.stop()
+
+  A plain function may also take ``self`` first, to keep handles on the instance.
 """
 
 import inspect
 
-from pyo import InputFader, PyoObject, Sig, SigTo, SLMap, SLMapMul
+from pyo import (Adsr, CallAfter, Fader, InputFader, PyoObject, Sig, SigTo,
+                 SLMap, SLMapMul)
 
 __all__ = ["pyosynth", "Synth"]
 
 _registry = {}  # name -> synth class, so Synth('name') works like in sc3
 _RESERVED = {"self", "mul", "add"}
+# Objects that start an envelope on play() and release it on stop().
+_GATED = (Adsr, Fader)
 
 
 def _camel(name):
@@ -85,10 +107,17 @@ def _default_slmap(name, value):
     return SLMap(-1.0, 1.0, "lin", name, value)
 
 
-def _build(func, lag, ranges, name):
+def _build(func, lag, ranges, name, user_cls=None):
+    name = name or func.__name__
     sig = inspect.signature(func)
     inputs, controls = [], {}
-    for p in sig.parameters.values():
+    params = list(sig.parameters.values())
+    wants_self = bool(params) and params[0].name == "self"
+    if wants_self:
+        params = params[1:]
+    elif user_cls is not None:
+        raise TypeError("%s.build must take `self` as its first parameter." % name)
+    for p in params:
         if p.kind not in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY):
             raise TypeError("@pyosynth does not support *args/**kwargs "
                             "or positional-only parameters ('%s')." % p.name)
@@ -102,7 +131,7 @@ def _build(func, lag, ranges, name):
     # Public signature: the function's parameters, plus mul and add.
     init_sig = inspect.Signature(
         [inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
-        + list(sig.parameters.values())
+        + params
         + [inspect.Parameter("mul", inspect.Parameter.KEYWORD_ONLY, default=1),
            inspect.Parameter("add", inspect.Parameter.KEYWORD_ONLY, default=0)])
 
@@ -135,7 +164,7 @@ def _build(func, lag, ranges, name):
                 graph_args[pname] = value  # constant (table, string, ...)
 
         # Build the user's graph.
-        result = func(**graph_args)
+        result = func(self, **graph_args) if wants_self else func(**graph_args)
         outs = list(result) if isinstance(result, (list, tuple)) else [result]
         if not outs or not all(isinstance(o, PyoObject) for o in outs):
             raise TypeError("A @pyosynth function must return a PyoObject "
@@ -148,7 +177,13 @@ def _build(func, lag, ranges, name):
         # Every object created inside the graph needs play()/stop()/out().
         roots = outs + list(self._sigs.values()) + list(self._faders.values())
         foreign = _reachable(external)
-        self._internal = [o for k, o in _reachable(roots).items() if k not in foreign]
+        internal = [o for k, o in _reachable(roots).items() if k not in foreign]
+        # Adsr/Fader are triggered by play() and released by stop(), so they
+        # are started last and released (not cut) on stop().
+        self._gated = [o for o in internal if isinstance(o, _GATED)]
+        self._internal = [o for o in internal if not isinstance(o, _GATED)]
+        self._halt_id = 0
+        self._halt_timer = None
 
     __init__.__signature__ = init_sig
 
@@ -171,19 +206,42 @@ def _build(func, lag, ranges, name):
         """Return the last raw value given for a parameter."""
         return self._values[pname]
 
-    def play(self, dur=0, delay=0):
+    def _start(self, dur, delay):
+        self._halt_id += 1  # cancels a pending stop() from an earlier release
         for o in self._internal:
             o.play(dur, delay)
+        for o in self._gated:  # trigger the envelopes last
+            o.play(dur, delay)
+
+    def _halt(self, token):
+        if token == self._halt_id:  # not restarted in the meantime
+            for o in self._internal:
+                o.stop()
+            PyoObject.stop(self)
+
+    def play(self, dur=0, delay=0):
+        _start(self, dur, delay)
         return PyoObject.play(self, dur, delay)
 
     def stop(self, wait=0):
-        for o in self._internal:
+        if not self._gated:
+            for o in self._internal:
+                o.stop(wait)
+            return PyoObject.stop(self, wait)
+        # Release the envelopes, then stop everything once the longest
+        # release (Adsr.release / Fader.fadeout) has finished.
+        release = 0.0
+        for o in self._gated:
             o.stop(wait)
-        return PyoObject.stop(self, wait)
+            release = max(release, getattr(o, "release", None)
+                          or getattr(o, "fadeout", 0) or 0)
+        self._halt_id += 1
+        self._halt_timer = CallAfter(self._halt, wait + release + 0.05,
+                                     arg=self._halt_id)
+        return self
 
     def out(self, chnl=0, inc=1, dur=0, delay=0):
-        for o in self._internal:
-            o.play(dur, delay)
+        _start(self, dur, delay)
         return PyoObject.out(self, chnl, inc, dur, delay)
 
     def ctrl(self, map_list=None, title=None, wxnoserver=False):
@@ -215,22 +273,28 @@ def _build(func, lag, ranges, name):
                         lambda self, x: self.set(pname, x),
                         doc="Parameter `%s`." % pname)
 
-    doc = inspect.getdoc(func) or ""
+    doc = (inspect.getdoc(user_cls) if user_cls else None) or inspect.getdoc(func) or ""
     doc += "\n\n    :Args:\n\n" + "\n".join(
         "        %s : %s" % (n, "audio input" if n in inputs
                              else "control, default %r" % (controls[n],))
         for n in list(inputs) + list(controls))
 
-    ns = {"__doc__": doc, "__module__": func.__module__, "__wrapped__": func,
-          "__init__": __init__, "set": set, "get": get, "play": play,
+    ns = {"__doc__": doc, "__module__": func.__module__,
+          "__init__": __init__, "_start": _start, "_halt": _halt,
+          "set": set, "get": get, "play": play,
           "stop": stop, "out": out, "ctrl": ctrl,
           "_param_names": tuple(inputs) + tuple(controls)}
     for pname in list(inputs) + list(controls):
         ns["set" + _camel(pname)] = make_setter(pname)
         ns[pname] = make_property(pname)
 
-    cls = type(name or func.__name__, (PyoObject,), ns)
-    _registry[name or func.__name__] = cls
+    cls = type(name, (PyoObject,), ns)
+    if user_cls is not None:
+        # The user's class comes first in the MRO, so its methods override
+        # the generated ones and `super()` reaches them.
+        cls = type(name, (user_cls, cls),
+                   {"__module__": user_cls.__module__, "__doc__": doc})
+    _registry[name] = cls
     return cls
 
 
@@ -251,6 +315,12 @@ def pyosynth(func=None, *, lag=0.0, ranges=None, name=None):
             Class / registry name. Defaults to the function's name.
     """
     def decorate(f):
+        if inspect.isclass(f):
+            if "build" not in vars(f):
+                raise TypeError("A @pyosynth class needs a `build(self, ...)` method.")
+            if "__init__" in vars(f):
+                raise TypeError("A @pyosynth class can't define __init__; use build().")
+            return _build(vars(f)["build"], lag, ranges, name or f.__name__, f)
         return _build(f, lag, ranges, name)
     return decorate if func is None else decorate(func)
 
